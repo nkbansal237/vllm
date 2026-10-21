@@ -13,6 +13,7 @@ from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
     get_kv_cache_coordinator,
 )
+from vllm.v1.core.kv_cache_memory_stats import classify_refusal
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
 from vllm.v1.core.single_type_kv_cache_manager import MambaManager
@@ -206,6 +207,8 @@ class KVCacheManager:
         # admitting waiting/preempted requests, to avoid frequent preemptions.
         assert watermark >= 0.0, "watermark must be non-negative"
         self.watermark_blocks = int(watermark * kv_cache_config.num_blocks)
+        # Why the last refused `allocate_slots` call was refused.
+        self.last_refusal_reason: str | None = None
         self.kv_cache_event_metadata = tuple(
             (
                 get_kv_cache_spec_kind(group.kv_cache_spec).value,
@@ -232,6 +235,17 @@ class KVCacheManager:
 
         """
         return self.block_pool.get_usage()
+
+    def _record_refusal(
+        self, num_required: int, watermark_blocks: int, reserved_blocks: int
+    ) -> None:
+        self.last_refusal_reason = classify_refusal(
+            num_required,
+            self.block_pool.get_num_free_blocks(),
+            watermark_blocks,
+            reserved_blocks,
+            capacity=self.block_pool.num_gpu_blocks - 1,
+        )
 
     def make_prefix_cache_stats(self) -> PrefixCacheStats | None:
         """Get (and reset) the prefix cache stats.
@@ -535,6 +549,7 @@ class KVCacheManager:
             )
             required_blocks = num_blocks_to_allocate + watermark_blocks
             if required_blocks > self.block_pool.get_num_free_blocks():
+                self._record_refusal(num_blocks_to_allocate, watermark_blocks, 0)
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -575,6 +590,9 @@ class KVCacheManager:
         required_blocks = num_blocks_to_allocate + watermark_blocks
         if required_blocks > available_blocks:
             # Cannot allocate new blocks
+            self._record_refusal(
+                num_blocks_to_allocate, watermark_blocks, reserved_blocks
+            )
             return None
 
         if (

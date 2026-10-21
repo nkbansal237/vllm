@@ -482,6 +482,14 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    def get_load_source(self, request_id: str) -> str:
+        """Name of the connector loading `request_id`'s external tokens.
+
+        Used to attribute KV load failures in metrics. Connectors that
+        delegate loads to other connectors return the delegate's name.
+        """
+        return type(self).__name__
+
     @abstractmethod
     def get_num_new_matched_tokens(
         self,

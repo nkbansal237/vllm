@@ -447,6 +447,12 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
                 to_return = (toks, load_async)
         return to_return
 
+    def get_load_source(self, request_id: str) -> str:
+        index = self._requests_to_connector.get(request_id)
+        if index is None:
+            return super().get_load_source(request_id)
+        return self._connectors[index].get_load_source(request_id)
+
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):

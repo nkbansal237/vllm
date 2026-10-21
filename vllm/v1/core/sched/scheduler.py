@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerConnector
@@ -36,6 +37,14 @@ from vllm.v1.core.encoder_cache_manager import (
     EncoderDecoderCacheManager,
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+from vllm.v1.core.kv_cache_memory_stats import (
+    RESERVED_INFLIGHT_LOAD,
+    RESERVED_WATERMARK,
+    KVAdmissionRefusalTracker,
+    KVBlockStateScanner,
+    KVLoadFailureTracker,
+    compute_token_slots,
+)
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
@@ -410,6 +419,18 @@ class Scheduler(SchedulerInterface):
         # In-flight requests still prefilling (prefill chunks + in-progress
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
+
+        # HBM KV cache memory statistics.
+        self.kv_refusal_tracker = KVAdmissionRefusalTracker()
+        self.kv_load_failure_tracker = KVLoadFailureTracker(
+            "recompute" if self.recompute_kv_load_failures else "fail"
+        )
+        self.kv_block_state_scanner = KVBlockStateScanner(
+            envs.VLLM_KV_BLOCK_STATE_INTERVAL_S
+        )
+        # Requests aborted while loading, whose blocks stay held until the
+        # load ends; their blocks count as loading, not held for a send.
+        self._finished_loading_req_ids: set[str] = set()
 
     def _mamba_block_aligned_split(
         self,
@@ -1222,12 +1243,26 @@ class Scheduler(SchedulerInterface):
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
+                    reason = self.kv_cache_manager.last_refusal_reason
+                    if reason is not None:
+                        num_queued = len(self.kv_holding_waiting) + len(self.waiting)
+                        self.kv_refusal_tracker.record_refusal(
+                            request_id, reason, num_queued_behind=num_queued - 1
+                        )
 
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
                     break
+
+                self.kv_refusal_tracker.record_admission(request_id)
+                if self.connector is not None and num_external_computed_tokens:
+                    self.kv_load_failure_tracker.record_claim(
+                        request_id,
+                        self.connector.get_load_source(request_id),
+                        num_external_computed_tokens,
+                    )
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
@@ -1996,6 +2031,14 @@ class Scheduler(SchedulerInterface):
         spec_decoding_stats: SpecDecodingStats | None = None
 
         failed_kv_load_req_ids: set[str] = set()
+        has_kv_load_failures = kv_connector_output is not None and bool(
+            kv_connector_output.failed_recving or kv_connector_output.invalid_block_ids
+        )
+        claims_before = (
+            self.kv_load_failure_tracker.snapshot(self.requests)
+            if has_kv_load_failures
+            else {}
+        )
         if kv_connector_output and kv_connector_output.failed_recving:
             failed_kv_load_req_ids.update(
                 self._handle_failed_recving(kv_connector_output.failed_recving)
@@ -2009,6 +2052,14 @@ class Scheduler(SchedulerInterface):
                     kv_connector_output.invalid_block_ids,
                     num_scheduled_tokens,
                 )
+            )
+        if has_kv_load_failures:
+            # Under the fail policy the returned requests are failed whole;
+            # under recompute they are rescheduled after rolling back.
+            self.kv_load_failure_tracker.record_failures(
+                claims_before,
+                self.requests,
+                () if self.recompute_kv_load_failures else failed_kv_load_req_ids,
             )
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best
@@ -2641,6 +2692,8 @@ class Scheduler(SchedulerInterface):
                 )
                 self.finished_recving_kv_req_ids.discard(request.request_id)
                 self.failed_recving_kv_req_ids.discard(request.request_id)
+                if delay_free_blocks:
+                    self._finished_loading_req_ids.add(request.request_id)
 
             request.status = finished_status
             self._free_request(request, delay_free_blocks=delay_free_blocks)
@@ -2682,6 +2735,9 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
         self._free_request_blocks(request)
         del self.requests[request.request_id]
+        self._finished_loading_req_ids.discard(request.request_id)
+        self.kv_refusal_tracker.forget(request.request_id)
+        self.kv_load_failure_tracker.forget(request.request_id)
 
     @property
     def pause_state(self) -> PauseState:
@@ -2886,6 +2942,7 @@ class Scheduler(SchedulerInterface):
         )
         num_running, num_waiting = self.get_request_counts()
         num_deferred = len(self.deferred_waiting)
+        kv_blocks_by_state, kv_orphan_blocks = self._make_kv_block_state_stats()
         return SchedulerStats(
             num_running_reqs=num_running,
             num_waiting_reqs=num_waiting - num_deferred,
@@ -2894,12 +2951,57 @@ class Scheduler(SchedulerInterface):
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,
             kv_cache_eviction_events=eviction_events,
+            kv_admission_reserved_blocks={
+                RESERVED_WATERMARK: (
+                    self.kv_cache_manager.watermark_blocks if self.running else 0
+                ),
+                RESERVED_INFLIGHT_LOAD: self._inflight_prefill_reserved_blocks(),
+            },
+            kv_admission_refusals=self.kv_refusal_tracker.take_counts(),
+            kv_load_failed_tokens=self.kv_load_failure_tracker.take_counts(),
+            kv_token_slots=compute_token_slots(
+                self.kv_cache_manager.coordinator.single_type_managers,
+                itertools.chain(
+                    self.running,
+                    (
+                        req
+                        for req in self.kv_holding_waiting
+                        if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+                    ),
+                ),
+            ),
+            kv_blocks_by_state=kv_blocks_by_state,
+            kv_orphan_blocks=kv_orphan_blocks,
             spec_decoding_stats=spec_stats,
             kv_connector_stats=connector_stats_payload,
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
             ec_connector_stats=ec_connector_stats_payload,
         )
+
+    def _make_kv_block_state_stats(
+        self,
+    ) -> tuple[dict[str, int] | None, list[tuple[int, str]] | None]:
+        """Block counts per state and orphan suspects, once per scan interval."""
+        managers = self.kv_cache_manager.coordinator.single_type_managers
+        # Blocks freed at a step fence, and copy-on-write sources, hold a
+        # reference outside the block tables until the step completes.
+        pinned_blocks = itertools.chain(
+            itertools.chain.from_iterable(blocks for _, blocks in self.deferred_frees),
+            (
+                source
+                for manager in managers
+                for source, _ in manager._pending_cow_copies
+            ),
+        )
+        scan = self.kv_block_state_scanner.maybe_scan(
+            self.kv_cache_manager.block_pool,
+            managers,
+            self.requests.values(),
+            self._finished_loading_req_ids,
+            pinned_blocks,
+        )
+        return scan if scan is not None else (None, None)
 
     def make_spec_decoding_stats(
         self,

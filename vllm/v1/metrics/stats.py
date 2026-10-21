@@ -207,6 +207,20 @@ class SchedulerStats:
 
     kv_cache_eviction_events: list[KVCacheEvictionEvent] = field(default_factory=list)
 
+    # HBM KV cache memory; see vllm/v1/core/kv_cache_memory_stats.py.
+    # Free blocks held back from admissions, by kind.
+    kv_admission_reserved_blocks: dict[str, int] = field(default_factory=dict)
+    # Refused admissions since the last stats, by reason.
+    kv_admission_refusals: dict[str, int] = field(default_factory=dict)
+    # (connector, policy, tokens) failed to load since the last stats.
+    kv_load_failed_tokens: list[tuple[str, str, int]] = field(default_factory=list)
+    # (kv_group, kind, slots) in the blocks of running and loading requests.
+    kv_token_slots: list[tuple[str, str, int]] = field(default_factory=list)
+    # Blocks per state and (block_id, last_owner) orphan suspects; None
+    # between the periodic block scans.
+    kv_blocks_by_state: dict[str, int] | None = None
+    kv_orphan_blocks: list[tuple[int, str]] | None = None
+
     spec_decoding_stats: SpecDecodingStats | None = None
     kv_connector_stats: dict[str, Any] | None = None
     ec_connector_stats: dict[str, Any] | None = None

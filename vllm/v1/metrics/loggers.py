@@ -23,6 +23,7 @@ from vllm.logger import init_logger
 from vllm.plugins import STAT_LOGGER_PLUGINS_GROUP, load_plugins_by_group
 from vllm.v1.engine import FinishReason
 from vllm.v1.metrics.buckets import histogram_buckets
+from vllm.v1.metrics.kv_cache_memory import KVCacheMemoryProm
 from vllm.v1.metrics.perf import PerfMetricsLogging, PerfMetricsProm
 from vllm.v1.metrics.prometheus import unregister_vllm_metrics
 from vllm.v1.metrics.stats import (
@@ -625,6 +626,10 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             counter_kv_cache_evictions, per_engine_labelvalues
         )
 
+        self.kv_cache_memory_prom = KVCacheMemoryProm(
+            self._gauge_cls, self._counter_cls, labelnames, per_engine_labelvalues
+        )
+
         #
         # External - KV connector prefix cache
         #
@@ -1067,6 +1072,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.counter_kv_cache_evictions[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.evicted_blocks
             )
+            self.kv_cache_memory_prom.observe(scheduler_stats, engine_idx)
 
             if scheduler_stats.connector_prefix_cache_stats is not None:
                 self.counter_connector_prefix_cache_queries[engine_idx].inc(

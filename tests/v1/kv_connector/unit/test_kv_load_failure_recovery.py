@@ -68,6 +68,37 @@ def test_failed_receive_completion_honors_failure_policy(policy):
         assert request.request_id in next_output.num_scheduled_tokens
 
 
+@pytest.mark.parametrize("policy", ["fail", "recompute"])
+def test_failed_receive_counts_claimed_tokens(policy):
+    """A failed receive loses every external token the connector claimed."""
+    scheduler = create_scheduler(create_vllm_config(kv_load_failure_policy=policy))
+    request = create_request(num_tokens=3 * scheduler.block_size)
+    scheduler.add_request(request)
+    scheduler.connector = Mock()
+    scheduler.connector.get_num_new_matched_tokens.return_value = (
+        2 * scheduler.block_size,
+        True,
+    )
+    scheduler.connector.get_load_source.return_value = "P2PConnector"
+    scheduler.connector.request_finished.return_value = (False, None)
+    scheduler.connector.take_events.return_value = ()
+    scheduler_output = scheduler.schedule()
+
+    output = create_model_runner_output([], finished_recving={request.request_id})
+    assert output.kv_connector_output is not None
+    output.kv_connector_output.failed_recving = {request.request_id}
+    engine_core_outputs = scheduler.update_from_output(scheduler_output, output)
+
+    stats = next(
+        outputs.scheduler_stats
+        for outputs in engine_core_outputs.values()
+        if outputs.scheduler_stats is not None
+    )
+    assert stats.kv_load_failed_tokens == [
+        ("P2PConnector", policy, 2 * scheduler.block_size)
+    ]
+
+
 @pytest.mark.parametrize(
     "num_prompt_blocks,num_external_computed_blocks,invalid_block_idxs",
     [

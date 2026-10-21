@@ -252,6 +252,7 @@ if TYPE_CHECKING:
     ) = None
     VLLM_SSM_CONV_STATE_LAYOUT: Literal["SD", "DS"] | None = None
     VLLM_COMPUTE_NANS_IN_LOGITS: bool = False
+    VLLM_KV_BLOCK_STATE_INTERVAL_S: float = 10.0
     VLLM_RAISE_ON_LOGIT_NANS: bool = False
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: Literal[
         "FP", "INT8", "INT6", "INT4", "INT3", "NONE"
@@ -1841,6 +1842,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #   consistent with SSM temporal state and LBHNC KV cache layout.
     "VLLM_SSM_CONV_STATE_LAYOUT": env_with_choices(
         "VLLM_SSM_CONV_STATE_LAYOUT", None, ["SD", "DS"]
+    ),
+    # Seconds between scans that classify every KV cache block by state for
+    # the vllm:kv_cache_blocks_by_state and vllm:kv_orphan_block_info metrics.
+    "VLLM_KV_BLOCK_STATE_INTERVAL_S": lambda: float(
+        os.getenv("VLLM_KV_BLOCK_STATE_INTERVAL_S", "10")
     ),
     # Enable checking whether the generated logits contain NaNs,
     # indicating corrupted output. Useful for debugging low level bugs
